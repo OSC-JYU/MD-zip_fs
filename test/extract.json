@@ -1,0 +1,6 @@
+{
+    "file": {
+        "path": "test/2_images.zip"
+    },
+    "target": "test/extracted"
+}
