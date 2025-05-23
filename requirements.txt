@@ -2,4 +2,6 @@ fastapi==0.109.2
 uvicorn==0.27.1
 python-multipart==0.0.9
 pydantic==2.6.1 
-aiohttpp==3.11.18
+aiohttp==3.11.18
+requests==2.32.3
+dotenv==0.9.9

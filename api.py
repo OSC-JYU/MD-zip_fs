@@ -12,7 +12,8 @@ import requests
 
 from pydantic import BaseModel
 
-from dotenv import load_dotenv
+MD_URL = os.getenv("MD_URL", "http://localhost:8200")
+MD_PATH = os.getenv("MD_PATH", "")
 
 app = FastAPI(
     title="zip API",
@@ -29,51 +30,12 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-load_dotenv()  
-DATA_DIR = os.getenv("MD_PATH", "data")
-
-
-
-async def send_file_to_upload_endpoint(file_path: str, project_rid: str, set_rid: str = None) -> dict:
-    """
-    Send a single file to the upload endpoint
-    """
-    url = f"http://localhost:8200/api/projects/{project_rid}/upload/{set_rid}"
-    print("Uploading file to:", url)
-
-    # Determine content type based on file extension
-    file_extension = os.path.splitext(file_path)[1].lower()
-    content_type = {
-        '.txt': 'text/plain',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.png': 'image/png'
-    }.get(file_extension, 'application/octet-stream')
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            data = aiohttp.FormData()
-            data.add_field('file',
-                         open(file_path, 'rb'),
-                         filename=os.path.basename(file_path),
-                         content_type=content_type)
-
-            async with session.post(url, data=data) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    print(f"Error uploading {file_path}: {response.status}")
-                    return None
-    except Exception as e:
-        print(f"Error sending file {file_path}: {str(e)}")
-        return None
-
 
 def send_file_to_upload_endpoint_sync(file_path: str, project_rid: str, set_rid: str = None) -> dict:
     """
     Send a single file to the upload endpoint using requests (synchronous)
     """
-    url = f"http://localhost:8200/api/projects/{project_rid}/upload/{set_rid}"
+    url = f"{MD_URL}/api/nomad/process/files"
     print("Uploading file to:", url)
 
     # Determine content type based on file extension
@@ -84,6 +46,16 @@ def send_file_to_upload_endpoint_sync(file_path: str, project_rid: str, set_rid:
         '.jpeg': 'image/jpeg',
         '.png': 'image/png'
     }.get(file_extension, 'application/octet-stream')
+
+    message = {
+        "file": {
+            "path": file_path,
+            "type": "image",
+            "extension": file_extension
+        },
+        "target": project_rid,
+        "output_set": set_rid
+    }
 
     try:
         with open(file_path, 'rb') as f:
@@ -118,7 +90,7 @@ async def process_files(
 ):
     try:
         print("Processing files...")
-        print(DATA_DIR)
+   
         # Start execution time counter
         import time
         start_time = time.time()
@@ -146,7 +118,7 @@ async def process_files(
 
         file_node = request_json.get('file')
         zip_file = file_node.get('path')
-        zip_path = os.path.join(DATA_DIR, zip_file)
+        zip_path = os.path.join(MD_PATH, zip_file)
         print("Zip file path:", zip_path)
 
         # get project rid from file path
@@ -154,11 +126,11 @@ async def process_files(
         print("Project rid:", project_rid)
 
         # make sure the file exists
-        if not os.path.exists(zip_path):
-            raise HTTPException(
-                status_code=404,
-                detail="File not found"
-            )
+        # if not os.path.exists(zip_path):
+        #     raise HTTPException(
+        #         status_code=404,
+        #         detail="File not found"
+        #     )
 
         # Allowed extensions
         allowed_extensions = ('.txt', '.jpg', '.jpeg', '.png')
@@ -177,16 +149,20 @@ async def process_files(
                         print(f"Extracted: {file}")
 
         except zipfile.BadZipFile:
+            print("Invalid or corrupted zip file")
             raise HTTPException(
                 status_code=400,
                 detail="Invalid or corrupted zip file"
             )
         except Exception as e:
+            print("Error extracting files:", e)
             raise HTTPException(
                 status_code=500,
                 detail=f"Error processing zip file: {str(e)}"
             )
 
+        print("Extracted files:", extracted_files)
+        
         # Send each extracted file to the upload endpoint using synchronous requests
         successful_uploads = []
         for file_path in extracted_files:
@@ -217,5 +193,5 @@ async def process_files(
 
 if __name__ == "__main__":
     import uvicorn
-    print(DATA_DIR)
-    uvicorn.run(app, host="0.0.0.0", port=9003) 
+    print(MD_URL)
+    uvicorn.run(app, host="0.0.0.0", port=9004) 

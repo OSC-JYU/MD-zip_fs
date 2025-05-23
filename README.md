@@ -12,11 +12,18 @@ endpoint is http://localhost:9003/process
 
 Payload is queue message as json file. 
 
-## Running as service
+## Running as service (locally)
+
+### Run with python
+
+	MD_PATH="/home/YOUR_USERNAME/MessyDesk" python api.py 
+
+
+### Run with docker/podman
 
 Create .env file with MD_PATH like this:
 
-	MD_PATH="/home/you/Projects/MessyDesk"
+	MD_PATH="/home/YOUR_USERNAME/MessyDesk"
 
 Then build and start
 
@@ -25,11 +32,11 @@ Then build and start
 
 or directly
 
- 	docker run --name pypdf -p 9002:9002 -v [MESSYDESK-PATH]/data/:/app/data:Z pypdf-api 
+ 	docker run --name pypdf -p 9004:9004 -v [MESSYDESK-PATH]/data/:/app/data:Z zip-api 
 
 ## Adapter (MD-consumer)
 
-	TOPIC=md-zip_fs node index.mjs
+	TOPIC=md-zip_fs node src/index.mjs
 
 
 
@@ -41,7 +48,7 @@ Run these from MD-zip_fs directory:
 
 	curl -X POST -H "Content-Type: multipart/form-data" \
 	  -F "request=@test/extract.json;type=application/json" \
-	  http://localhost:9003/process
+	  http://localhost:9004/process
 
 
 

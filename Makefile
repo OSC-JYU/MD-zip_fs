@@ -10,14 +10,14 @@ ifneq (,$(wildcard .env))
     export
 endif
 
-ifeq ($(MD_PROJECT_PATH),)
-    $(error MD_PROJECT_PATH is not set. Please set it in .env file or environment)
+ifeq ($(MD_PATH),)
+    $(error MD_PATH is not set. Please set it in .env file or environment)
 endif
 
 
 
 print-env:
-	@echo "MD_PROJECT_PATH: $(MD_PROJECT_PATH)"
+	@echo "MD_PATH: $(MD_PATH)"
 
 clean:
 	docker rm -f $(CONTAINERS)
@@ -27,9 +27,10 @@ build:
 	docker build -t $(REPOSITORY)/messydesk/$(IMAGE):$(VERSION) .
 
 start:
-	docker run -d --name $(IMAGE) \
-		-p 9003:9003 \
-		-v $(MD_PROJECT_PATH)/data/:/app/data:Z \
+	docker run -d --replace --name $(IMAGE) \
+		-p 9004:9004 \
+		-e MD_URL=http://host.containers.internal:8200 \
+		-v $(MD_PATH)/data/:/app/data:Z \
 		--restart unless-stopped \
 		$(REPOSITORY)/messydesk/$(IMAGE):$(VERSION)
 
