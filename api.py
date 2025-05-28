@@ -9,7 +9,7 @@ import aiohttp
 import asyncio
 from typing import List
 import requests
-
+import shutil
 from pydantic import BaseModel
 
 MD_URL = os.getenv("MD_URL", "http://localhost:8200")
@@ -30,43 +30,68 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+UPLOAD_DIR = "./output"
 
-def send_file_to_upload_endpoint_sync(file_path: str, project_rid: str, set_rid: str = None) -> dict:
+def send_file_to_upload_endpoint_sync(file_path: str, project_rid: str, request_json: object, total_files: int, upload_count: int, temp_dir: str = None) -> dict:
     """
     Send a single file to the upload endpoint using requests (synchronous)
     """
     url = f"{MD_URL}/api/nomad/process/files"
     print("Uploading file to:", url)
+    print(request_json)
+    set_rid = request_json.get('output_set')
+    process = request_json.get('process')
+    userId = request_json.get('userId')
 
     # Determine content type based on file extension
-    file_extension = os.path.splitext(file_path)[1].lower()
+    file_extension = os.path.splitext(file_path)[1].lower().replace('.', '')
     content_type = {
-        '.txt': 'text/plain',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.png': 'image/png'
+        'txt': 'text/plain',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png'
     }.get(file_extension, 'application/octet-stream')
+
+    file_type = {
+        'txt': 'text',
+        'jpg': 'image',
+        'jpeg': 'image',
+        'png': 'image'
+    }.get(file_extension, 'file')
 
     message = {
         "file": {
             "path": file_path,
-            "type": "image",
-            "extension": file_extension
+            "type": file_type,
+            "extension": file_extension,
+            "label": os.path.basename(file_path)
         },
         "target": project_rid,
-        "output_set": set_rid
+        "process": process,
+        "output_set": set_rid,
+        "userId": userId,
+        "total_files": total_files,
+        "current_file": upload_count + 1
     }
+
+    file_path = os.path.join(temp_dir, os.path.basename(file_path))
 
     try:
         with open(file_path, 'rb') as f:
             files = {
-                'file': (
-                    os.path.basename(file_path),
+                'content': (
+                    file_path,
                     f,
                     content_type
+                ),
+                'request': (
+                    'request.json',
+                    json.dumps(message),
+                    'application/json'
                 )
             }
             response = requests.post(url, files=files)
+            print(response.text)
             
             if response.status_code == 200:
                 return response.json()
@@ -105,7 +130,11 @@ async def process_files(
                 status_code=400,
                 detail="Missing required fields: file.path"
             )
-
+        if 'process' not in request_json or '@rid' not in request_json['process']:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required fields: process"
+            )
         if 'target' not in request_json:
             raise HTTPException(
                 status_code=400,
@@ -113,17 +142,14 @@ async def process_files(
             )
 
 
-        set_rid = request_json.get('output_set').replace("#", "")
-        print("Set rid:", set_rid)
+        set_rid = request_json.get('output_set')
 
         file_node = request_json.get('file')
         zip_file = file_node.get('path')
         zip_path = os.path.join(MD_PATH, zip_file)
-        print("Zip file path:", zip_path)
 
         # get project rid from file path
         project_rid = zip_file.split("/projects/")[1].split("/")[0].replace("_", ":")
-        print("Project rid:", project_rid)
 
         # make sure the file exists
         # if not os.path.exists(zip_path):
@@ -133,7 +159,9 @@ async def process_files(
         #     )
 
         # Allowed extensions
-        allowed_extensions = ('.txt', '.jpg', '.jpeg', '.png')
+        allowed_extensions = ('txt', 'jpg', 'jpeg', 'png')
+        temp_dir = os.path.join(UPLOAD_DIR, str(uuid.uuid4()))
+        os.makedirs(temp_dir, exist_ok=True)
 
         extracted_files = []
         try:
@@ -144,9 +172,9 @@ async def process_files(
                 # Extract only files with allowed extensions
                 for file in file_list:
                     if file.lower().endswith(allowed_extensions):
-                        zip_ref.extract(file, request_json['target'])
-                        extracted_files.append(os.path.join(request_json['target'], file))
-                        print(f"Extracted: {file}")
+                        zip_ref.extract(file, temp_dir)
+                        extracted_files.append(file)
+
 
         except zipfile.BadZipFile:
             print("Invalid or corrupted zip file")
@@ -161,7 +189,7 @@ async def process_files(
                 detail=f"Error processing zip file: {str(e)}"
             )
 
-        print("Extracted files:", extracted_files)
+        
         
         # Send each extracted file to the upload endpoint using synchronous requests
         successful_uploads = []
@@ -169,16 +197,34 @@ async def process_files(
             result = send_file_to_upload_endpoint_sync(
                 file_path, 
                 project_rid,
-                set_rid
+                request_json,
+                len(extracted_files),
+                len(successful_uploads),
+                temp_dir
             )
             if result:
                 successful_uploads.append(result)
+
+        # remove temp dir
+        shutil.rmtree(temp_dir)
+        
+        # Notify MD that we are done
+        # print("Notifying MD that we are done")
+        # done_md = f"{MD_URL}/api/nomad/process/files/done"
+        # done_md_response = requests.post(
+        #     done_md,
+        #     json=request_json,
+        #     headers={
+        #         'Content-Type': 'application/json'
+        #     }
+        # ).json()
 
         # End execution time counter
         end_time = time.time()
         return {
             "execution_time": round(end_time - start_time, 1),
             "total_files": len(extracted_files),
+            "current_file": len(extracted_files),
             "successful_uploads": len(successful_uploads)
         }
         

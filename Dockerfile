@@ -11,7 +11,7 @@ RUN mkdir -p /app/data
 COPY requirements.txt .
 
 # Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy the application code
 COPY api.py .
