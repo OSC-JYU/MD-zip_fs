@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt && apt-get clean && rm -rf /v
 COPY api.py .
 
 # Expose the port the app runs on
-EXPOSE 9003
+EXPOSE 9004
 
 # Command to run the application
 CMD ["python", "api.py"] 
