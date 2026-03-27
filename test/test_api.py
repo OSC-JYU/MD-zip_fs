@@ -7,20 +7,9 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
 
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
-
-
-class FakeResponse:
-    def __init__(self, status_code, payload=None, text=""):
-        self.status_code = status_code
-        self._payload = payload if payload is not None else {}
-        self.text = text
-
-    def json(self):
-        return self._payload
 
 
 class ZipFsApiTests(unittest.IsolatedAsyncioTestCase):
@@ -36,9 +25,6 @@ class ZipFsApiTests(unittest.IsolatedAsyncioTestCase):
         if "api" in sys.modules:
             del sys.modules["api"]
         cls.api = importlib.import_module("api")
-
-        # Keep callback execution deterministic in tests.
-        setattr(cls.api, "CALLBACK_WORKERS", 1)
 
     @classmethod
     def tearDownClass(cls):
@@ -84,33 +70,31 @@ class ZipFsApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         message = self._build_message(rel_zip_path)
-        with patch("api.requests.post", return_value=FakeResponse(200, {"success": True})) as mocked_post:
-            result = await self._call_process(message)
+        result = await self._call_process(message)
 
+        self.assertEqual(result["response"]["type"], "disk")
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["total_files"], 2)
-        self.assertEqual(result["successful_uploads"], 2)
-        self.assertEqual(result["failed_uploads"], 0)
-        self.assertEqual(mocked_post.call_count, 2)
+        self.assertEqual(result["total_files"], 3)
+        self.assertEqual(len(result["response"]["files"]), 3)
 
-    async def test_process_partial_success_on_callback_failure(self):
-        rel_zip_path = "data/dir_test/projects/1_4/files/a/b/c/source/single.zip"
+    async def test_process_filters_by_allowed_extensions(self):
+        rel_zip_path = "data/dir_test/projects/1_4/files/a/b/c/source/mixed.zip"
         self._create_zip_in_md_path(
             rel_zip_path,
             {
-                "images/hamburger.jpg": b"img-bytes",
+                "docs/keep.txt": b"hello",
+                "docs/skip.bin": b"ignored",
             },
         )
 
         message = self._build_message(rel_zip_path)
-        with patch("api.requests.post", return_value=FakeResponse(500, text="backend error")):
-            result = await self._call_process(message)
+        message["task"]["params"] = {"allowed_extensions": ["txt"]}
+        result = await self._call_process(message)
 
-        self.assertEqual(result["status"], "partial_success")
+        self.assertEqual(result["status"], "success")
         self.assertEqual(result["total_files"], 1)
-        self.assertEqual(result["successful_uploads"], 0)
-        self.assertEqual(result["failed_uploads"], 1)
-        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(len(result["response"]["files"]), 1)
+        self.assertEqual(result["response"]["files"][0]["label"], "keep.txt")
 
     async def test_rejects_path_traversal_without_backend(self):
         message = self._build_message("../../etc/passwd")
@@ -120,30 +104,22 @@ class ZipFsApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
 
-    async def test_retries_callback_then_succeeds(self):
-        rel_zip_path = "data/dir_test/projects/1_4/files/a/b/c/source/retry.zip"
+    async def test_returns_404_when_no_allowed_files_in_zip(self):
+        rel_zip_path = "data/dir_test/projects/1_4/files/a/b/c/source/no-allowed.zip"
         self._create_zip_in_md_path(
             rel_zip_path,
             {
-                "images/hamburger.jpg": b"img-bytes",
+                "docs/skip.bin": b"ignored",
             },
         )
 
         message = self._build_message(rel_zip_path)
-        side_effect = [
-            FakeResponse(503, text="busy"),
-            FakeResponse(200, {"success": True}),
-        ]
+        message["task"]["params"] = {"allowed_extensions": ["txt"]}
 
-        with patch.object(self.api, "CALLBACK_RETRIES", 2), \
-             patch.object(self.api, "CALLBACK_RETRY_BACKOFF_SEC", 0), \
-             patch("api.requests.post", side_effect=side_effect) as mocked_post:
-            result = await self._call_process(message)
+        with self.assertRaises(HTTPException) as ctx:
+            await self._call_process(message)
 
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["successful_uploads"], 1)
-        self.assertEqual(result["failed_uploads"], 0)
-        self.assertEqual(mocked_post.call_count, 2)
+        self.assertEqual(ctx.exception.status_code, 404)
 
     async def test_invalid_or_broken_zip_returns_400(self):
         rel_zip_path = "data/dir_test/projects/1_4/files/a/b/c/source/broken.zip"
@@ -181,13 +157,14 @@ class ZipFsApiTests(unittest.IsolatedAsyncioTestCase):
             "userId": "#49:0",
         }
 
-        with patch("api.requests.post") as mocked_post:
-            result = await self._call_process(message)
+        result = await self._call_process(message)
 
+        self.assertEqual(result["response"]["type"], "disk")
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["zipped_files"], 2)
         self.assertEqual(result["skipped_files"], 0)
-        mocked_post.assert_not_called()
+        self.assertEqual(len(result["response"]["files"]), 1)
+        self.assertEqual(result["response"]["files"][0]["label"], output_name)
 
         zip_path = Path(self.tempdir.name) / "data" / "dir_test" / "tmp" / output_name
         self.assertTrue(zip_path.exists())

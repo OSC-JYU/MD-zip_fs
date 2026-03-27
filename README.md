@@ -6,25 +6,28 @@ An experimental MessyDesk wrapper for zip
 The purposes of this script is to provide an endpoint to MessyDesk for zip extracting.
 This reads zip file directly from project directory of MessyDesk (_fs = file storage).
 
-The service writes extracted files directly to `data/<DB_NAME>/tmp` and reports them through
-`POST /api/nomad/process/files/tmp`.
+The service writes extracted files directly to `data/<DB_NAME>/tmp` and returns a
+`response.type = "disk"` payload with file descriptors. The adapter (`elg_fs`) is
+responsible for posting these files to MessyDesk `POST /api/nomad/process/files/tmp`.
+
+Important:
+- In disk mode, `MD_PATH` is required.
+- `response.files[].path` is filename only (no absolute or directory path).
 
 ## API
 
 endpoint is `http://localhost:9004/process`
 
-Payload is queue message as multipart file field `request` containing JSON.
+Payload is queue message as multipart file field `message` containing JSON.
 
 The service extracts matching files from a zip under MessyDesk storage and stages them
-to `data/<DB_NAME>/tmp`, then calls:
-
-- `POST /api/nomad/process/files/tmp`
+to `data/<DB_NAME>/tmp`.
 
 It also supports an internal `zip` task for set downloads. In that mode it:
 
 - receives set file list through queue message payload,
 - writes resulting archive to `data/<DB_NAME>/tmp/<zip_output_name>`,
-- does not call backend callback endpoints.
+- returns that archive as disk output for adapter handling.
 
 ## Running as service (locally)
 
@@ -32,6 +35,8 @@ Create .env file with MD_PATH like this:
 
 	MD_PATH="/home/YOUR_USERNAME/Projects/MessyDesk"
 	MD_URL="http://localhost:8200"
+
+Service loads `.env` automatically on startup.
 
 ### Run with python
 
@@ -62,7 +67,7 @@ Run these from MD-zip_fs directory:
 
 
 	curl -X POST -H "Content-Type: multipart/form-data" \
-	  -F "request=@test/extract.json;type=application/json" \
+	-F "message=@test/extract.json;type=application/json" \
 	  http://localhost:9004/process
 
 
@@ -94,10 +99,25 @@ Optional:
 - `MD_CALLBACK_RETRY_BACKOFF_SEC`
 - `LOG_LEVEL` (default `INFO`)
 
+## Disk response contract
+
+Example file item:
+
+```json
+{
+	"path": "zipfs_abcd1234_file.txt",
+	"label": "file.txt",
+	"type": "text",
+	"extension": "txt"
+}
+```
+
+The adapter forwards each file with `tmp_path` set to filename only.
+
 ## Testing
 
 The service can be tested without a running MessyDesk backend.
-Tests mock outbound `requests.post` calls and use a temporary local `MD_PATH`.
+Tests use a temporary local `MD_PATH` and validate disk-mode responses.
 
 Run:
 

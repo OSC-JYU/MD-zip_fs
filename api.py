@@ -5,27 +5,19 @@ from dotenv import load_dotenv
 import uuid
 import json
 import zipfile
-import requests
 import shutil
 import time
-from typing import Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
 import logging
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 MD_URL = os.getenv("MD_URL", "http://localhost:8200")
 MD_PATH_ENV = os.getenv("MD_PATH", "")
 CONTAINER_MODE = os.getenv("CONTAINER", "").strip().lower() in ("1", "true", "yes", "on")
-
-CALLBACK_CONNECT_TIMEOUT = float(os.getenv("MD_CALLBACK_CONNECT_TIMEOUT", "3"))
-CALLBACK_READ_TIMEOUT = float(os.getenv("MD_CALLBACK_READ_TIMEOUT", "30"))
-CALLBACK_RETRIES = int(os.getenv("MD_CALLBACK_RETRIES", "3"))
-CALLBACK_RETRY_BACKOFF_SEC = float(os.getenv("MD_CALLBACK_RETRY_BACKOFF_SEC", "1.0"))
-RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
-DEFAULT_ALLOWED_EXTENSIONS = ('txt', 'jpg', 'jpeg', 'png')
+STORAGE_MODE = (os.getenv("STORAGE_MODE") or os.getenv("FILE_STORAGE_MODE") or "disk").strip().lower()
+DEFAULT_ALLOWED_EXTENSIONS = ('txt', 'jpg', 'jpeg', 'png', 'pdf', 'json')
 REQUEST_READ_CHUNK_SIZE = int(os.getenv("REQUEST_READ_CHUNK_SIZE", str(1024 * 1024)))
 COPY_CHUNK_SIZE = int(os.getenv("COPY_CHUNK_SIZE", str(1024 * 1024)))
-CALLBACK_WORKERS = max(1, int(os.getenv("MD_CALLBACK_WORKERS", "4")))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("md-zip-fs")
@@ -36,6 +28,9 @@ def resolve_md_root(md_path_env: str, container_mode: bool) -> str:
 
     Expected root is the directory that contains the `data/` directory.
     """
+    if STORAGE_MODE == "disk" and (not isinstance(md_path_env, str) or not md_path_env.strip()):
+        raise RuntimeError("MD_PATH must be set when STORAGE_MODE=disk")
+
     candidates = []
     if isinstance(md_path_env, str) and md_path_env.strip():
         raw = os.path.abspath(md_path_env.strip())
@@ -163,8 +158,12 @@ def normalize_extensions(values) -> tuple:
     return tuple(dict.fromkeys(normalized))
 
 
-def get_allowed_extensions(task: dict) -> tuple:
-    """Resolve allowed extensions from task params first, then env, then defaults."""
+def get_allowed_extensions(task: dict, task_id: Optional[str] = None) -> Optional[tuple]:
+    """Resolve allowed extensions.
+
+    For unzip, default is no filtering (extract all files) unless task/env sets
+    allowed extensions explicitly.
+    """
     params = task.get('params', {}) if isinstance(task, dict) else {}
     from_task = params.get('allowed_extensions')
     if isinstance(from_task, list):
@@ -181,6 +180,10 @@ def get_allowed_extensions(task: dict) -> tuple:
         parsed = normalize_extensions(from_env.split(','))
         if parsed:
             return parsed
+
+    # Unzip should not silently drop files by extension when no filter is set.
+    if task_id == 'unzip':
+        return None
 
     return DEFAULT_ALLOWED_EXTENSIONS
 
@@ -216,6 +219,33 @@ def sanitize_zip_filename(name: Optional[str], fallback_prefix: str = "set") -> 
     if not candidate.lower().endswith('.zip'):
         candidate = candidate + '.zip'
     return candidate
+
+
+def infer_file_type(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower().lstrip('.')
+    if ext in {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'}:
+        return 'image'
+    if ext == 'json':
+        return 'json'
+    if ext == 'csv':
+        return 'csv'
+    if ext == 'pdf':
+        return 'pdf'
+    if ext == 'zip':
+        return 'zip'
+    return 'text'
+
+
+def to_disk_response(task_id: str, files: List[Dict[str, Any]], **extra: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "task": task_id,
+        "response": {
+            "type": "disk",
+            "files": files,
+        },
+    }
+    payload.update(extra)
+    return payload
 
 
 def create_set_zip_in_tmp(request_json: dict) -> dict:
@@ -302,105 +332,11 @@ def create_set_zip_in_tmp(request_json: dict) -> dict:
     return {
         "status": "success",
         "zip_output_name": output_name,
+        "zip_abs_path": final_zip_path,
         "zip_tmp_path": f"data/{db_name}/tmp/{output_name}",
         "zipped_files": zipped_files,
         "skipped_files": skipped_files,
     }
-
-
-def send_file_to_tmp_endpoint(tmp_relative_path: str, source_file_path: str, original_label: str, project_rid: str,
-                              request_json: dict, total_files: int, upload_count: int) -> Tuple[Optional[dict], Optional[str]]:
-    """Notify MessyDesk to process file already written under data/<DB_NAME>/tmp."""
-    url = f"{MD_URL}/api/nomad/process/files/tmp"
-    set_rid = request_json.get('output_set')
-    process = request_json.get('process')
-    userId = request_json.get('userId')
-    source_file = request_json.get('file', {})
-    process_rid = process.get('@rid') if isinstance(process, dict) else None
-    log_event(
-        "info",
-        "tmp_callback_start",
-        process_rid=process_rid,
-        source_file_rid=source_file.get('@rid'),
-        tmp_path=tmp_relative_path,
-        label=original_label,
-        current_file=upload_count + 1,
-        total_files=total_files,
-    )
-
-    file_extension = os.path.splitext(source_file_path)[1].lower().replace('.', '')
-
-    file_type = {
-        'txt': 'text',
-        'jpg': 'image',
-        'jpeg': 'image',
-        'png': 'image',
-        'gif': 'image',
-        'webp': 'image'
-    }.get(file_extension, 'file')
-
-    message = {
-        "file": {
-            "@rid": source_file.get('@rid'),
-            "project_rid": source_file.get('project_rid'),
-            "path": source_file_path,
-            "type": file_type,
-            "extension": file_extension,
-            "label": original_label
-        },
-        "target": request_json.get('target', project_rid),
-        "process": process,
-        "output_set": set_rid,
-        "userId": userId,
-        "total_files": total_files,
-        "current_file": upload_count + 1
-    }
-
-    payload = {
-        "message": message,
-        "tmp_path": tmp_relative_path
-    }
-
-    last_error = None
-    for attempt in range(1, CALLBACK_RETRIES + 1):
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=(CALLBACK_CONNECT_TIMEOUT, CALLBACK_READ_TIMEOUT)
-            )
-            log_event(
-                "info",
-                "tmp_callback_response",
-                process_rid=process_rid,
-                tmp_path=tmp_relative_path,
-                status_code=response.status_code,
-            )
-            if response.status_code == 200:
-                return response.json(), None
-
-            err = f"http_{response.status_code}: {response.text[:300]}"
-            if response.status_code in RETRYABLE_STATUS_CODES and attempt < CALLBACK_RETRIES:
-                time.sleep(CALLBACK_RETRY_BACKOFF_SEC * attempt)
-                continue
-            return None, err
-        except requests.RequestException as e:
-            last_error = str(e)
-            log_event(
-                "warning",
-                "tmp_callback_retryable_exception",
-                process_rid=process_rid,
-                tmp_path=tmp_relative_path,
-                attempt=attempt,
-                error=last_error,
-            )
-            if attempt < CALLBACK_RETRIES:
-                time.sleep(CALLBACK_RETRY_BACKOFF_SEC * attempt)
-                continue
-            break
-
-    return None, (last_error or "callback_request_failed")
 
 
 @app.get("/")
@@ -410,28 +346,29 @@ async def root():
 
 @app.post("/process")
 async def process_files(
-    request: UploadFile = File(...)
+    message: UploadFile = File(...)
 ):
     process_rid = None
     source_file_rid = None
     output_set = None
     extracted_count = 0
-    successful_uploads = []
-    failed_uploads = []
+    output_files: List[Dict[str, Any]] = []
     status = "failed"
     start_time = time.time()
+    print("Received /process request, starting processing...")
 
     try:
         log_event("info", "process_start")
 
-        # Parse request JSON in-memory to avoid disk roundtrip overhead.
+        # Parse message JSON in-memory to avoid disk roundtrip overhead.
         request_chunks = []
         while True:
-            chunk = await request.read(REQUEST_READ_CHUNK_SIZE)
+            chunk = await message.read(REQUEST_READ_CHUNK_SIZE)
             if not chunk:
                 break
             request_chunks.append(chunk)
         request_json = json.loads(b"".join(request_chunks).decode("utf-8"))
+        print(f"Received request: {json.dumps(request_json, indent=2)}")
 
         log_event("info", "request_parsed", has_payload=isinstance(request_json, dict))
 
@@ -441,8 +378,10 @@ async def process_files(
 
         task = request_json.get('task', {})
         task_id = task.get('id') if isinstance(task, dict) else None
+        if not task_id:
+            raise HTTPException(400, "Missing required fields: task.id")
 
-        # Set zip export task writes archive to backend tmp without callbacks.
+        # Set zip export task writes archive to MessyDesk tmp and returns file descriptor.
         if task_id == 'zip':
             process_obj = request_json.get('process', {})
             if isinstance(process_obj, dict):
@@ -455,6 +394,16 @@ async def process_files(
             result = create_set_zip_in_tmp(request_json)
             end_time = time.time()
             status = "success"
+            archive_label = result.get("zip_output_name") or os.path.basename(result["zip_abs_path"])
+            archive_ext = os.path.splitext(archive_label)[1].lower().lstrip('.') or 'zip'
+            output_files = [
+                {
+                    "path": archive_label,
+                    "label": archive_label,
+                    "type": "zip",
+                    "extension": archive_ext,
+                }
+            ]
             log_event(
                 "info",
                 "process_summary",
@@ -463,26 +412,22 @@ async def process_files(
                 source_file_rid=source_file_rid,
                 output_set=output_set,
                 total_files=result.get('zipped_files', 0),
-                successful_uploads=result.get('zipped_files', 0),
+                successful_uploads=1,
                 failed_uploads=result.get('skipped_files', 0),
                 duration_sec=round(end_time - start_time, 3),
                 zip_output_name=result.get('zip_output_name'),
             )
-            return {
-                "execution_time": round(end_time - start_time, 1),
-                **result,
-            }
+            return to_disk_response(
+                task_id,
+                output_files,
+                execution_time=round(end_time - start_time, 1),
+                status=status,
+                zipped_files=result.get("zipped_files", 0),
+                skipped_files=result.get("skipped_files", 0),
+            )
 
         if 'file' not in request_json or 'path' not in request_json['file']:
             raise HTTPException(400, "Missing required fields: file.path")
-        if '@rid' not in request_json['file']:
-            raise HTTPException(400, "Missing required fields: file.@rid")
-        if 'process' not in request_json or '@rid' not in request_json['process']:
-            raise HTTPException(400, "Missing required fields: process")
-        if 'task' not in request_json:
-            raise HTTPException(400, "Missing required field: task")
-        if 'userId' not in request_json:
-            raise HTTPException(400, "Missing required field: userId")
 
         file_node = request_json.get('file')
         if not isinstance(file_node, dict):
@@ -518,7 +463,7 @@ async def process_files(
         task = request_json.get('task')
         if not isinstance(task, dict):
             raise HTTPException(400, "Invalid task object")
-        allowed_extensions = get_allowed_extensions(task)
+        allowed_extensions = get_allowed_extensions(task, task_id)
         try:
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 allowed_files = []
@@ -528,69 +473,47 @@ async def process_files(
                     base_name = os.path.basename(item.filename)
                     if not base_name:
                         continue
-                    ext = os.path.splitext(base_name)[1].lower().lstrip('.')
-                    if ext in allowed_extensions:
+                    if allowed_extensions is None:
                         allowed_files.append(item)
+                    else:
+                        ext = os.path.splitext(base_name)[1].lower().lstrip('.')
+                        if ext in allowed_extensions:
+                            allowed_files.append(item)
 
                 total_allowed = len(allowed_files)
-                pending = []
+                for _, file in enumerate(allowed_files, start=1):
+                    extracted_count += 1
+                    safe_name = os.path.basename(file.filename)
+                    tmp_filename = f"zipfs_{uuid.uuid4().hex}_{safe_name}"
+                    dest_path = os.path.join(tmp_root, tmp_filename)
 
-                with ThreadPoolExecutor(max_workers=CALLBACK_WORKERS) as pool:
-                    for index, file in enumerate(allowed_files, start=1):
-                        extracted_count += 1
-                        safe_name = os.path.basename(file.filename)
-                        tmp_filename = f"zipfs_{uuid.uuid4().hex}_{safe_name}"
-                        dest_path = os.path.join(tmp_root, tmp_filename)
+                    # Stream extract directly to data/<db>/tmp.
+                    with zip_ref.open(file, 'r') as src, open(dest_path, 'wb') as dst:
+                        shutil.copyfileobj(src, dst, length=COPY_CHUNK_SIZE)
 
-                        # Stream extract directly to data/<db>/tmp so upload is not needed.
-                        with zip_ref.open(file, 'r') as src, open(dest_path, 'wb') as dst:
-                            shutil.copyfileobj(src, dst, length=COPY_CHUNK_SIZE)
+                    ext = os.path.splitext(safe_name)[1].lower().lstrip('.')
+                    output_files.append(
+                        {
+                            "path": tmp_filename,
+                            "label": safe_name,
+                            "type": infer_file_type(safe_name),
+                            "extension": ext or "bin",
+                        }
+                    )
 
-                        future = pool.submit(
-                            send_file_to_tmp_endpoint,
-                            tmp_filename,
-                            dest_path,
-                            safe_name,
-                            project_rid,
-                            request_json,
-                            total_allowed,
-                            index - 1,
-                        )
-                        pending.append((future, safe_name, tmp_filename, dest_path))
-
-                    for future, safe_name, tmp_filename, dest_path in pending:
-                        result, callback_error = future.result()
-                        if result:
-                            successful_uploads.append(result)
-                        else:
-                            log_event(
-                                "warning",
-                                "tmp_callback_failed",
-                                process_rid=process_rid,
-                                source_file_rid=source_file_rid,
-                                output_set=output_set,
-                                file=safe_name,
-                                tmp_path=tmp_filename,
-                                error=callback_error or "callback_failed",
-                            )
-                            failed_uploads.append({
-                                "file": safe_name,
-                                "tmp_path": tmp_filename,
-                                "error": callback_error or "callback_failed"
-                            })
-
-                        # MessyDesk may move/delete the tmp file while consuming it.
-                        if os.path.exists(dest_path):
-                            os.remove(dest_path)
+                if total_allowed == 0:
+                    raise HTTPException(404, "No files matching allowed extensions found in zip")
 
         except zipfile.BadZipFile:
             raise HTTPException(400, "Invalid or corrupted zip file")
+        except HTTPException:
+            raise
         except Exception as e:
             log_event("error", "zip_processing_error", process_rid=process_rid, error=str(e))
             raise HTTPException(500, f"Error processing zip file: {str(e)}")
 
         end_time = time.time()
-        status = "partial_success" if failed_uploads else "success"
+        status = "success"
         log_event(
             "info",
             "process_summary",
@@ -599,19 +522,18 @@ async def process_files(
             source_file_rid=source_file_rid,
             output_set=output_set,
             total_files=extracted_count,
-            successful_uploads=len(successful_uploads),
-            failed_uploads=len(failed_uploads),
+            successful_uploads=len(output_files),
+            failed_uploads=0,
             duration_sec=round(end_time - start_time, 3),
         )
-        return {
-            "execution_time": round(end_time - start_time, 1),
-            "total_files": extracted_count,
-            "current_file": extracted_count,
-            "successful_uploads": len(successful_uploads),
-            "failed_uploads": len(failed_uploads),
-            "status": status,
-            "errors": failed_uploads
-        }
+        return to_disk_response(
+            task_id,
+            output_files,
+            execution_time=round(end_time - start_time, 1),
+            total_files=extracted_count,
+            current_file=extracted_count,
+            status=status,
+        )
 
     except HTTPException:
         end_time = time.time()
@@ -624,8 +546,8 @@ async def process_files(
                 source_file_rid=source_file_rid,
                 output_set=output_set,
                 total_files=extracted_count,
-                successful_uploads=len(successful_uploads),
-                failed_uploads=len(failed_uploads),
+                successful_uploads=len(output_files),
+                failed_uploads=0,
                 duration_sec=round(end_time - start_time, 3),
             )
         raise
