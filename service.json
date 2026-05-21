@@ -1,0 +1,45 @@
+{
+    "local_url": "http://localhost:9004",
+    "id": "md-zip_fs",
+    "type": "zip",
+    "api_type": "elg",
+    "adapter": "elg_fs",
+    "api": "/process",
+    "name": "Zip",
+    "supported_types": [
+        "zip"
+    ],
+    "supported_formats": [
+        "zip"
+    ],
+    "description": "zip file operations",
+    "tasks": {
+        "unzip": {
+            "params": {
+                "task": "unzip",
+                "allowed_extensions": ""
+            },
+            "params_help": {
+                "allowed_extensions": {
+                    "name": "allowed_extensions",
+                    "help": "Optional. Extract only these extensions (comma-separated), for example: pdf,txt,png",
+                    "description": "Optional. Extract only these extensions (comma-separated), for example: pdf,txt,png",
+                    "display": "textinput"
+                }
+            },
+            "output_set": "Files from zip",
+            "name": "Unzip",
+            "description": "Unzip a zip file.",
+            "behaviour": "one-to-many"
+        },
+        "zip": {
+            "params": {
+                "task": "zip"
+            },
+            "name": "Zip Set",
+            "description": "Create a zip archive from set files.",
+            "hidden": true,
+            "behaviour": "many-to-one"
+        }
+    }
+}

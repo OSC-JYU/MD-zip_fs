@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 import os
 from dotenv import load_dotenv
 import uuid
@@ -9,6 +10,7 @@ import shutil
 import time
 from typing import Any, Dict, List, Optional
 import logging
+from pathlib import Path
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 MD_URL = os.getenv("MD_URL", "http://localhost:8200")
@@ -21,6 +23,14 @@ COPY_CHUNK_SIZE = int(os.getenv("COPY_CHUNK_SIZE", str(1024 * 1024)))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("md-zip-fs")
+
+SERVICE_DESCRIPTOR_PATH = Path(os.getenv("SERVICE_DESCRIPTOR_PATH", "./service.json")).resolve()
+SERVICE_HELP_PATH = Path(os.getenv("SERVICE_HELP_PATH", "./index.md")).resolve()
+SERVICE_HELP_FALLBACK_PATH = Path(os.getenv("SERVICE_HELP_FALLBACK_PATH", "./README.md")).resolve()
+SERVICE_ID_OVERRIDE = os.getenv("SERVICE_ID")
+SERVICE_NAME_OVERRIDE = os.getenv("SERVICE_NAME")
+SERVICE_ADAPTER_OVERRIDE = os.getenv("SERVICE_ADAPTER")
+SERVICE_LOCAL_URL_OVERRIDE = os.getenv("SERVICE_LOCAL_URL")
 
 
 def resolve_md_root(md_path_env: str, container_mode: bool) -> str:
@@ -158,6 +168,26 @@ def normalize_extensions(values) -> tuple:
     return tuple(dict.fromkeys(normalized))
 
 
+def parse_extension_value(value: Any) -> tuple:
+    if isinstance(value, list):
+        return normalize_extensions(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return tuple()
+        # Accept JSON array string (e.g. ["pdf", "txt"]) or comma/space separated text.
+        if raw.startswith('[') and raw.endswith(']'):
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, list):
+                    return normalize_extensions(loaded)
+            except Exception:
+                pass
+        separators_normalized = raw.replace(';', ',').replace(' ', ',')
+        return normalize_extensions([part for part in separators_normalized.split(',') if part])
+    return tuple()
+
+
 def get_allowed_extensions(task: dict, task_id: Optional[str] = None) -> Optional[tuple]:
     """Resolve allowed extensions.
 
@@ -165,13 +195,9 @@ def get_allowed_extensions(task: dict, task_id: Optional[str] = None) -> Optiona
     allowed extensions explicitly.
     """
     params = task.get('params', {}) if isinstance(task, dict) else {}
-    from_task = params.get('allowed_extensions')
-    if isinstance(from_task, list):
-        parsed = normalize_extensions(from_task)
-        if parsed:
-            return parsed
-    if isinstance(from_task, str):
-        parsed = normalize_extensions(from_task.split(','))
+    # Prefer explicit task params in this order.
+    for key in ('allowed_extensions', 'extensions', 'include_extensions'):
+        parsed = parse_extension_value(params.get(key))
         if parsed:
             return parsed
 
@@ -246,6 +272,36 @@ def to_disk_response(task_id: str, files: List[Dict[str, Any]], **extra: Any) ->
     }
     payload.update(extra)
     return payload
+
+
+def load_service_descriptor() -> Dict[str, Any]:
+    try:
+        descriptor = json.loads(SERVICE_DESCRIPTOR_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"Descriptor file not found: {SERVICE_DESCRIPTOR_PATH}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Descriptor file is not valid JSON: {exc}") from exc
+
+    if not isinstance(descriptor, dict):
+        raise HTTPException(status_code=500, detail="Descriptor root must be a JSON object")
+
+    if SERVICE_ID_OVERRIDE:
+        descriptor["id"] = SERVICE_ID_OVERRIDE
+    if SERVICE_NAME_OVERRIDE:
+        descriptor["name"] = SERVICE_NAME_OVERRIDE
+    if SERVICE_ADAPTER_OVERRIDE:
+        descriptor["adapter"] = SERVICE_ADAPTER_OVERRIDE
+    if SERVICE_LOCAL_URL_OVERRIDE:
+        descriptor["local_url"] = SERVICE_LOCAL_URL_OVERRIDE
+
+    return descriptor
+
+
+def load_help_markdown() -> str:
+    for candidate in (SERVICE_HELP_PATH, SERVICE_HELP_FALLBACK_PATH):
+        if candidate.exists() and candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise HTTPException(status_code=404, detail="Help markdown file not found")
 
 
 def create_set_zip_in_tmp(request_json: dict) -> dict:
@@ -342,6 +398,22 @@ def create_set_zip_in_tmp(request_json: dict) -> dict:
 @app.get("/")
 async def root():
     return {"message": "zip API for MessyDesk"}
+
+
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {"status": "ok", "service": "md-zip_fs"}
+
+
+@app.get("/config")
+async def config() -> Dict[str, Any]:
+    return load_service_descriptor()
+
+
+@app.get("/help")
+async def help_markdown() -> PlainTextResponse:
+    markdown = load_help_markdown()
+    return PlainTextResponse(markdown, media_type="text/markdown")
 
 
 @app.post("/process")
